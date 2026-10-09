@@ -1,11 +1,11 @@
 """Bounded subprocess harness for candidate Python code."""
 from __future__ import annotations
-import os
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Thread
 
 @dataclass(frozen=True)
 class SandboxResult:
@@ -15,7 +15,7 @@ class SandboxResult:
     return_code: int | None = None
 
 class Sandbox:
-    """Run Python in a temporary working directory with time/output bounds.
+    """Run a proposal with wall-clock and captured-output bounds.
 
     A subprocess is not an OS security sandbox. Production deployments must
     supply container/OS isolation before executing proposals from untrusted sources.
@@ -31,14 +31,38 @@ class Sandbox:
         with tempfile.TemporaryDirectory(prefix='microagent-edge-') as directory:
             script = Path(directory) / 'proposal.py'
             script.write_text(source, encoding='utf-8')
-            env = {'PATH': os.environ.get('PATH', ''), 'PYTHONIOENCODING': 'utf-8'}
+            process = subprocess.Popen(
+                [sys.executable, '-I', '-S', str(script)], cwd=directory,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=False, shell=False,
+            )
+            if process.stdout is None:
+                process.kill()
+                raise RuntimeError('Failed to open sandbox output pipe')
+            chunks: list[bytes] = []
+            stored = 0
+            def drain_output() -> None:
+                nonlocal stored
+                while True:
+                    chunk = process.stdout.read(4096)
+                    if not chunk:
+                        break
+                    remaining = self.max_output_bytes - stored
+                    if remaining > 0:
+                        chunks.append(chunk[:remaining])
+                        stored += min(len(chunk), remaining)
+            reader = Thread(target=drain_output, name='microagent-output-reader', daemon=True)
+            reader.start()
+            timed_out = False
             try:
-                completed = subprocess.run([sys.executable, '-I', '-S', str(script)],
-                    cwd=directory, env=env, capture_output=True, text=True,
-                    timeout=self.timeout_seconds, check=False, shell=False)
-            except subprocess.TimeoutExpired as exc:
-                output = (exc.stdout or b'').decode(errors='replace') if isinstance(exc.stdout, bytes) else (exc.stdout or '')
-                return SandboxResult(False, output[:self.max_output_bytes], 'Execution timed out')
-            output = (completed.stdout + completed.stderr)[:self.max_output_bytes]
-            return SandboxResult(completed.returncode == 0, output,
-                '' if completed.returncode == 0 else f'Process exited with code {completed.returncode}', completed.returncode)
+                return_code = process.wait(timeout=self.timeout_seconds)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                process.kill()
+                return_code = process.wait()
+            reader.join()
+            output = b''.join(chunks).decode('utf-8', errors='replace')
+            if timed_out:
+                return SandboxResult(False, output, 'Execution timed out', return_code)
+            return SandboxResult(return_code == 0, output,
+                '' if return_code == 0 else f'Process exited with code {return_code}', return_code)
