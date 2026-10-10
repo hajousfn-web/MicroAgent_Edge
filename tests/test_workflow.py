@@ -49,9 +49,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(result.executed)
     def test_captured_output_is_bounded(self):
         result = Sandbox(timeout_seconds=3, max_output_bytes=64).execute("import os; print('PATH_PRESENT=' + str('PATH' in os.environ)); print('TMP_IS_CWD=' + str(os.environ.get('TMP') == os.getcwd())); print('x' * 10000)")
-        self.assertTrue(result.success and result.output.startswith('PATH_PRESENT=False
-TMP_IS_CWD=True
-'))
+        self.assertTrue(result.success and result.output.splitlines()[:2] == ['PATH_PRESENT=False', 'TMP_IS_CWD=True'])
         self.assertLessEqual(len(result.output.encode('utf-8')), 64)
 
 if __name__ == '__main__':
