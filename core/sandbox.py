@@ -44,13 +44,14 @@ class Sandbox:
             if process.stdout is None:
                 process.kill()
                 raise RuntimeError('Failed to open sandbox output pipe')
+            stdout = process.stdout
             chunks: list[bytes] = []
             stored = 0
             lock = Lock()
             def drain_output() -> None:
                 nonlocal stored
                 while True:
-                    chunk = process.stdout.read(4096)
+                    chunk = stdout.read(4096)
                     if not chunk:
                         return
                     with lock:
@@ -67,7 +68,10 @@ class Sandbox:
                 timed_out = True
                 process.kill()
                 return_code = process.wait()
-            reader.join(timeout=1.0)
+            finally:
+                reader.join(timeout=1.0)
+                if not stdout.closed:
+                    stdout.close()
             with lock:
                 output = b''.join(chunks).decode('utf-8', errors='replace')
             if timed_out:

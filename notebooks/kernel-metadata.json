@@ -1,0 +1,15 @@
+{
+  "id": "soufianehajou/gemma4-microagent-edge-submission",
+  "title": "MicroAgent-Edge Gemma 4 Submission Archive Builder",
+  "code_file": "gemma4_submission_runner.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "competition_sources": [
+    "gemma-4-developer-agent"
+  ],
+  "kernel_sources": []
+}
