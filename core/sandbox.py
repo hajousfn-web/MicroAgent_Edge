@@ -32,14 +32,14 @@ class Sandbox:
         with tempfile.TemporaryDirectory(prefix='microagent-edge-') as directory:
             script = Path(directory) / 'proposal.py'
             script.write_text(source, encoding='utf-8')
-            env = {'PATH': os.environ.get('PATH', ''), 'PYTHONIOENCODING': 'utf-8'}
-            for name in ('SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP'):
+            env = {'PYTHONIOENCODING': 'utf-8', 'TMP': directory, 'TEMP': directory}
+            for name in ('SYSTEMROOT', 'WINDIR'):
                 if name in os.environ:
                     env[name] = os.environ[name]
             process = subprocess.Popen(
                 [sys.executable, '-I', '-S', str(script)], cwd=directory, env=env,
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, shell=False,
+                stderr=subprocess.STDOUT, shell=False, close_fds=True,
             )
             if process.stdout is None:
                 process.kill()
