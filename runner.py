@@ -256,13 +256,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--inference", default=os.environ.get("MICROAGENT_INFERENCE"),
                         help="Local module:function backend (or set MICROAGENT_INFERENCE)")
     parser.add_argument("--timeout", type=float, default=0.5,
-                        help="Per-proposal subprocess timeout in seconds (default: 0.5)")     parser.add_argument("--max-retries", type=int, default=2,                         help="Maximum self-correction retries (default: 2)")
+                        help="Per-proposal subprocess timeout in seconds (default: 0.5)"); parser.add_argument("--max-retries", type=int, default=2,                         help="Maximum self-correction retries (default: 2)")
     parser.add_argument("--max-tasks", type=int, default=None,
                         help="Optional task limit for local smoke runs")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    if args.timeout <= 0:
-        parser.error("--timeout must be positive")     if args.max_retries < 0:         parser.error("--max-retries cannot be negative")
+    if args.timeout <= 0 or args.max_retries < 0:
+        parser.error("--timeout must be positive and --max-retries cannot be negative")
     if args.max_tasks is not None and args.max_tasks < 0:
         parser.error("--max-tasks cannot be negative")
     if not args.inference:
