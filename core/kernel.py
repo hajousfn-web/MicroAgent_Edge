@@ -124,8 +124,7 @@ class ExecutionKernel:
             if any(not report.valid for report in reports) and not failures:
                 failures.append('Validator rejected proposal without a diagnostic')
             if failures:
-                detail = '
-'.join(failures)
+                detail = '; '.join(failures)
                 feedback = self._attempt_feedback(attempt, 'validation', detail)
                 if attempt <= retry_limit:
                     self._transition(KernelState.RETRYING)
