@@ -22,15 +22,15 @@ class KernelTests(unittest.TestCase):
         result = self.kernel.process_proposal("print('safe')")
         self.assertTrue(result.executed)
         self.assertEqual(self.sandbox.calls, ["print('safe')"])
-        self.assertEqual(self.kernel.state, KernelState.IDLE)
+        self.assertEqual(self.kernel.state, KernelState.COMPLETED)
     def test_blocked_call_is_rejected_without_execution(self):
         result = self.kernel.process_proposal("open('file')")
-        self.assertEqual(result.status, 'REJECTED')
+        self.assertEqual(result.status, 'FAILED')
         self.assertFalse(result.executed)
         self.assertEqual(self.sandbox.calls, [])
     def test_invalid_syntax_is_rejected(self):
         result = self.kernel.process_proposal('def (')
-        self.assertEqual(result.status, 'REJECTED')
+        self.assertEqual(result.status, 'FAILED')
         self.assertEqual(self.sandbox.calls, [])
 
 class AdvisoryTests(unittest.TestCase):
