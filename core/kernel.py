@@ -4,6 +4,7 @@ import logging
 import traceback
 from dataclasses import dataclass
 from enum import Enum
+from types import SimpleNamespace
 from typing import Any, Protocol
 from core.sandbox import Sandbox, SandboxResult
 from core.validator import ValidationReport
@@ -22,14 +23,11 @@ class KernelState(str, Enum):
 
 class ProposalValidator(Protocol):
     def validate(self, proposal: str) -> ValidationReport: ...
-
 class AdvisoryProposal(Protocol):
     proposed_patch: str
-
 class Advisory(Protocol):
     def analyze_and_propose(self, code_snippet: str, error_log: str,
                             code_graph: str = '') -> AdvisoryProposal: ...
-
 class PatchAdapter(Protocol):
     def apply_patch(self, validated_code: str) -> bool: ...
 
@@ -49,28 +47,29 @@ class KernelResult:
                 'feedback': self.feedback}
 
 class ExecutionKernel:
-    """Govern candidate repair through a strict FSM and bounded retry count."""
+    """Run a strict FSM with a bounded number of advisory repair attempts."""
     _ALLOWED = {
         KernelState.IDLE: {KernelState.ANALYZING, KernelState.HALTED},
         KernelState.ANALYZING: {KernelState.VALIDATING, KernelState.FAILED, KernelState.HALTED},
         KernelState.VALIDATING: {KernelState.EXECUTING, KernelState.RETRYING, KernelState.COMPLETED, KernelState.FAILED, KernelState.HALTED},
         KernelState.EXECUTING: {KernelState.RETRYING, KernelState.COMPLETED, KernelState.FAILED, KernelState.HALTED},
         KernelState.RETRYING: {KernelState.ANALYZING, KernelState.FAILED, KernelState.HALTED},
-        KernelState.COMPLETED: set(),
-        KernelState.FAILED: set(),
-        KernelState.HALTED: set(),
+        KernelState.COMPLETED: set(), KernelState.FAILED: set(), KernelState.HALTED: set(),
     }
     def __init__(self, validators: list[ProposalValidator], sandbox: Sandbox,
                  adapter: PatchAdapter | None = None, max_retries: int = 2) -> None:
         if not validators:
             raise ValueError('At least one deterministic validator is required')
-        if not isinstance(max_retries, int) or isinstance(max_retries, bool) or max_retries < 0:
-            raise ValueError('max_retries must be a non-negative integer')
+        self._check_retry_limit(max_retries)
         self._validators = tuple(validators)
         self._sandbox = sandbox
         self._adapter = adapter
         self.max_retries = max_retries
         self._state = KernelState.IDLE
+    @staticmethod
+    def _check_retry_limit(value: int) -> None:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError('max_retries must be a non-negative integer')
     @property
     def state(self) -> KernelState:
         return self._state
@@ -94,11 +93,13 @@ class ExecutionKernel:
         return '
 '.join(parts)
     def process_with_advisor(self, advisor: Advisory, source: str, diagnostics: str,
-                             code_graph: str = '') -> KernelResult:
-        """Generate, validate, execute, and feed exact failures back for correction."""
+                             code_graph: str = '', max_retries: int | None = None) -> KernelResult:
+        """Ask for a patch, validate/run it, and feed exact failures into retries."""
         self._ensure_idle()
+        retry_limit = self.max_retries if max_retries is None else max_retries
+        self._check_retry_limit(retry_limit)
         feedback = diagnostics
-        for attempt in range(1, self.max_retries + 2):
+        for attempt in range(1, retry_limit + 2):
             self._transition(KernelState.ANALYZING)
             try:
                 advice = advisor.analyze_and_propose(source, feedback, code_graph)
@@ -130,15 +131,14 @@ class ExecutionKernel:
             if any(not report.valid for report in reports) and not failures:
                 failures.append('Validator rejected proposal without a diagnostic')
             if failures:
-                feedback = self._attempt_feedback(attempt, 'validation', '
-'.join(failures))
-                if attempt <= self.max_retries:
+                detail = '
+'.join(failures)
+                feedback = self._attempt_feedback(attempt, 'validation', detail)
+                if attempt <= retry_limit:
                     self._transition(KernelState.RETRYING)
-                    logger.info('Retrying proposal after validation rejection (attempt %d)', attempt)
                     continue
                 self._transition(KernelState.FAILED)
-                return KernelResult('FAILED', self._state, False, '
-'.join(failures),
+                return KernelResult('FAILED', self._state, False, detail,
                                     attempts=attempt, feedback=feedback)
             self._transition(KernelState.EXECUTING)
             try:
@@ -146,9 +146,9 @@ class ExecutionKernel:
             except Exception:
                 detail = traceback.format_exc()
                 feedback = self._attempt_feedback(attempt, 'sandbox execution', detail)
-                if attempt <= self.max_retries:
+                if attempt <= retry_limit:
                     self._transition(KernelState.RETRYING)
-                    logger.exception('Sandbox raised; requesting corrected proposal')
+                    logger.exception('Sandbox raised; requesting a corrected proposal')
                     continue
                 self._transition(KernelState.FAILED)
                 return KernelResult('FAILED', self._state, False, detail,
@@ -157,9 +157,9 @@ class ExecutionKernel:
                 detail = result.error or 'Sandbox reported execution failure'
                 feedback = self._attempt_feedback(attempt, 'sandbox execution', detail,
                                                   result.output, result.return_code)
-                if attempt <= self.max_retries:
+                if attempt <= retry_limit:
                     self._transition(KernelState.RETRYING)
-                    logger.warning('Sandbox rejected candidate; retrying (attempt %d)', attempt)
+                    logger.warning('Sandbox failed; retrying proposal (attempt %d)', attempt)
                     continue
                 self._transition(KernelState.FAILED)
                 return KernelResult('FAILED', self._state, False, detail, result.output,
@@ -171,8 +171,8 @@ class ExecutionKernel:
                     detail = traceback.format_exc()
                     self._transition(KernelState.FAILED)
                     logger.exception('Patch adapter failed')
-                    return KernelResult('FAILED', self._state, False, detail, result.output,
-                                        attempt, detail)
+                    return KernelResult('FAILED', self._state, False, detail,
+                                        result.output, attempt, detail)
                 if not applied:
                     self._transition(KernelState.FAILED)
                     return KernelResult('FAILED', self._state, False,
@@ -183,17 +183,15 @@ class ExecutionKernel:
                                 attempts=attempt, feedback=feedback if attempt > 1 else '')
         raise RuntimeError('Retry loop terminated without a terminal result')
     def process_proposal(self, proposal: str) -> KernelResult:
-        """Validate and run one supplied proposal; use process_with_advisor for retries."""
+        """Validate a supplied proposal once; use process_with_advisor for repair retries."""
         self._ensure_idle()
         if not isinstance(proposal, str) or not proposal.strip():
             raise ValueError('Proposal must be a non-empty string')
         class FixedAdvisory:
             def analyze_and_propose(self, code_snippet: str, error_log: str,
                                     code_graph: str = '') -> Any:
-                from dataclasses import make_dataclass
-                return make_dataclass('FixedProposal', [('proposed_patch', str)])(proposal)
-        return self.process_with_advisor(FixedAdvisory(), '', '', '')
+                return SimpleNamespace(proposed_patch=proposal)
+        return self.process_with_advisor(FixedAdvisory(), '', '', max_retries=0)
     def halt(self) -> None:
-        if self._state in (KernelState.COMPLETED, KernelState.FAILED, KernelState.HALTED):
-            return
-        self._transition(KernelState.HALTED)
+        if self._state not in (KernelState.COMPLETED, KernelState.FAILED, KernelState.HALTED):
+            self._transition(KernelState.HALTED)
