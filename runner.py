@@ -203,7 +203,7 @@ def _write_parquet(rows: list[dict[str, str]], destination: Path) -> None:
 
 
 def run(data_dir: Path, output_path: Path, inference: Callable[[str], str],
-        timeout_seconds: float, max_tasks: int | None = None) -> list[dict[str, str]]:
+        timeout_seconds: float, max_retries: int = 2, max_tasks: int | None = None) -> list[dict[str, str]]:
     """Evaluate tasks locally and write their predictions to Parquet."""
     tasks_path = data_dir / "tasks.jsonl"
     if not tasks_path.is_file():
@@ -232,7 +232,7 @@ def run(data_dir: Path, output_path: Path, inference: Callable[[str], str],
                     candidate_box["source"] = record["proposed_patch"]
                 return response
             advisor = GemmaAdvisoryAgent(inference_fn=capture_candidate)
-            kernel = ExecutionKernel([PythonProposalValidator()], Sandbox(timeout_seconds=timeout_seconds))
+            kernel = ExecutionKernel([PythonProposalValidator()], Sandbox(timeout_seconds=timeout_seconds), max_retries=max_retries)
             result = kernel.process_with_advisor(advisor, source, _diagnostics(task), graph_context)
             if result.status == "SUCCESS":
                 candidate = candidate_box.get("source", "")
@@ -268,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.inference:
         parser.error("Set --inference module:function to a local Gemma backend; no model is downloaded or simulated")
     try:
-        run(args.data_dir, args.output, _load_inference(args.inference), args.timeout, args.max_tasks)
+        run(args.data_dir, args.output, _load_inference(args.inference), args.timeout, args.max_retries, args.max_tasks)
     except Exception as exc:
         LOGGER.error("Evaluation failed: %s", exc)
         return 1
