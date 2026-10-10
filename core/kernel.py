@@ -1,6 +1,7 @@
-"""Kernel authority for validating and applying advisory proposals."""
+"""Kernel authority for bounded, deterministic proposal correction."""
 from __future__ import annotations
 import logging
+import traceback
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
@@ -12,10 +13,11 @@ logger = logging.getLogger(__name__)
 class KernelState(str, Enum):
     IDLE = 'IDLE'
     ANALYZING = 'ANALYZING'
-    PROPOSING = 'PROPOSING'
     VALIDATING = 'VALIDATING'
     EXECUTING = 'EXECUTING'
-    REJECTED = 'REJECTED'
+    RETRYING = 'RETRYING'
+    COMPLETED = 'COMPLETED'
+    FAILED = 'FAILED'
     HALTED = 'HALTED'
 
 class ProposalValidator(Protocol):
@@ -38,28 +40,36 @@ class KernelResult:
     executed: bool
     reason: str = ''
     output: str = ''
+    attempts: int = 0
+    feedback: str = ''
     def to_dict(self) -> dict[str, Any]:
         return {'status': self.status, 'state': self.state.value,
-                'executed': self.executed, 'reason': self.reason, 'output': self.output}
+                'executed': self.executed, 'reason': self.reason,
+                'output': self.output, 'attempts': self.attempts,
+                'feedback': self.feedback}
 
 class ExecutionKernel:
-    """FSM owning deterministic validation, subprocess checks, and patch application."""
+    """Govern candidate repair through a strict FSM and bounded retry count."""
     _ALLOWED = {
-        KernelState.IDLE: {KernelState.ANALYZING, KernelState.VALIDATING, KernelState.HALTED},
-        KernelState.ANALYZING: {KernelState.PROPOSING, KernelState.HALTED},
-        KernelState.PROPOSING: {KernelState.VALIDATING, KernelState.HALTED},
-        KernelState.VALIDATING: {KernelState.EXECUTING, KernelState.REJECTED, KernelState.HALTED},
-        KernelState.EXECUTING: {KernelState.IDLE, KernelState.REJECTED, KernelState.HALTED},
-        KernelState.REJECTED: {KernelState.IDLE, KernelState.HALTED},
+        KernelState.IDLE: {KernelState.ANALYZING, KernelState.HALTED},
+        KernelState.ANALYZING: {KernelState.VALIDATING, KernelState.FAILED, KernelState.HALTED},
+        KernelState.VALIDATING: {KernelState.EXECUTING, KernelState.RETRYING, KernelState.COMPLETED, KernelState.FAILED, KernelState.HALTED},
+        KernelState.EXECUTING: {KernelState.RETRYING, KernelState.COMPLETED, KernelState.FAILED, KernelState.HALTED},
+        KernelState.RETRYING: {KernelState.ANALYZING, KernelState.FAILED, KernelState.HALTED},
+        KernelState.COMPLETED: set(),
+        KernelState.FAILED: set(),
         KernelState.HALTED: set(),
     }
     def __init__(self, validators: list[ProposalValidator], sandbox: Sandbox,
-                 adapter: PatchAdapter | None = None) -> None:
+                 adapter: PatchAdapter | None = None, max_retries: int = 2) -> None:
         if not validators:
             raise ValueError('At least one deterministic validator is required')
+        if not isinstance(max_retries, int) or isinstance(max_retries, bool) or max_retries < 0:
+            raise ValueError('max_retries must be a non-negative integer')
         self._validators = tuple(validators)
         self._sandbox = sandbox
         self._adapter = adapter
+        self.max_retries = max_retries
         self._state = KernelState.IDLE
     @property
     def state(self) -> KernelState:
@@ -70,70 +80,120 @@ class ExecutionKernel:
         logger.info('Kernel state: %s -> %s', self._state.value, new_state.value)
         self._state = new_state
     def _ensure_idle(self) -> None:
-        if self._state is KernelState.HALTED:
-            raise RuntimeError('Kernel is halted')
         if self._state is not KernelState.IDLE:
-            raise RuntimeError(f'Kernel is busy in state {self._state.value}')
+            raise RuntimeError(f'Kernel cannot start a run from state {self._state.value}')
+    @staticmethod
+    def _attempt_feedback(attempt: int, phase: str, detail: str,
+                          output: str = '', return_code: int | None = None) -> str:
+        parts = [f'Attempt {attempt} failed during {phase}.', detail]
+        if return_code is not None:
+            parts.append(f'Sandbox return code: {return_code}')
+        if output:
+            parts.append('Captured sandbox output/traceback (verbatim):
+' + output)
+        return '
+'.join(parts)
     def process_with_advisor(self, advisor: Advisory, source: str, diagnostics: str,
                              code_graph: str = '') -> KernelResult:
-        """Get advisory data, then govern its candidate through the complete FSM."""
+        """Generate, validate, execute, and feed exact failures back for correction."""
         self._ensure_idle()
-        self._transition(KernelState.ANALYZING)
-        try:
-            advice = advisor.analyze_and_propose(source, diagnostics, code_graph)
-            self._transition(KernelState.PROPOSING)
-            proposal = advice.proposed_patch
+        feedback = diagnostics
+        for attempt in range(1, self.max_retries + 2):
+            self._transition(KernelState.ANALYZING)
+            try:
+                advice = advisor.analyze_and_propose(source, feedback, code_graph)
+                proposal = advice.proposed_patch
+            except Exception:
+                detail = traceback.format_exc()
+                self._transition(KernelState.FAILED)
+                logger.exception('Advisory inference failed')
+                return KernelResult('FAILED', self._state, False, detail,
+                                    attempts=attempt, feedback=detail)
             if not isinstance(proposal, str) or not proposal.strip():
-                raise ValueError('Advisor returned an empty or invalid patch')
+                detail = 'Advisor returned an empty or invalid patch'
+                self._transition(KernelState.FAILED)
+                return KernelResult('FAILED', self._state, False, detail,
+                                    attempts=attempt, feedback=detail)
             self._transition(KernelState.VALIDATING)
-            return self._validate_and_execute(proposal)
-        except Exception:
-            if self._state is not KernelState.HALTED:
-                self._transition(KernelState.HALTED)
-            logger.exception('Advisory workflow failed; kernel halted')
-            raise
+            if proposal.strip() == 'NO_PATCH':
+                self._transition(KernelState.COMPLETED)
+                return KernelResult('NO_PATCH', self._state, False, attempts=attempt)
+            try:
+                reports = [validator.validate(proposal) for validator in self._validators]
+            except Exception:
+                detail = traceback.format_exc()
+                self._transition(KernelState.FAILED)
+                logger.exception('Validator raised an exception')
+                return KernelResult('FAILED', self._state, False, detail,
+                                    attempts=attempt, feedback=detail)
+            failures = [issue for report in reports for issue in report.issues]
+            if any(not report.valid for report in reports) and not failures:
+                failures.append('Validator rejected proposal without a diagnostic')
+            if failures:
+                feedback = self._attempt_feedback(attempt, 'validation', '
+'.join(failures))
+                if attempt <= self.max_retries:
+                    self._transition(KernelState.RETRYING)
+                    logger.info('Retrying proposal after validation rejection (attempt %d)', attempt)
+                    continue
+                self._transition(KernelState.FAILED)
+                return KernelResult('FAILED', self._state, False, '
+'.join(failures),
+                                    attempts=attempt, feedback=feedback)
+            self._transition(KernelState.EXECUTING)
+            try:
+                result: SandboxResult = self._sandbox.execute(proposal)
+            except Exception:
+                detail = traceback.format_exc()
+                feedback = self._attempt_feedback(attempt, 'sandbox execution', detail)
+                if attempt <= self.max_retries:
+                    self._transition(KernelState.RETRYING)
+                    logger.exception('Sandbox raised; requesting corrected proposal')
+                    continue
+                self._transition(KernelState.FAILED)
+                return KernelResult('FAILED', self._state, False, detail,
+                                    attempts=attempt, feedback=feedback)
+            if not result.success:
+                detail = result.error or 'Sandbox reported execution failure'
+                feedback = self._attempt_feedback(attempt, 'sandbox execution', detail,
+                                                  result.output, result.return_code)
+                if attempt <= self.max_retries:
+                    self._transition(KernelState.RETRYING)
+                    logger.warning('Sandbox rejected candidate; retrying (attempt %d)', attempt)
+                    continue
+                self._transition(KernelState.FAILED)
+                return KernelResult('FAILED', self._state, False, detail, result.output,
+                                    attempt, feedback)
+            if self._adapter is not None:
+                try:
+                    applied = self._adapter.apply_patch(proposal)
+                except Exception:
+                    detail = traceback.format_exc()
+                    self._transition(KernelState.FAILED)
+                    logger.exception('Patch adapter failed')
+                    return KernelResult('FAILED', self._state, False, detail, result.output,
+                                        attempt, detail)
+                if not applied:
+                    self._transition(KernelState.FAILED)
+                    return KernelResult('FAILED', self._state, False,
+                                        'Environment adapter declined patch application',
+                                        result.output, attempt)
+            self._transition(KernelState.COMPLETED)
+            return KernelResult('SUCCESS', self._state, True, output=result.output,
+                                attempts=attempt, feedback=feedback if attempt > 1 else '')
+        raise RuntimeError('Retry loop terminated without a terminal result')
     def process_proposal(self, proposal: str) -> KernelResult:
-        """Validate an externally supplied candidate before any execution."""
+        """Validate and run one supplied proposal; use process_with_advisor for retries."""
         self._ensure_idle()
         if not isinstance(proposal, str) or not proposal.strip():
             raise ValueError('Proposal must be a non-empty string')
-        self._transition(KernelState.VALIDATING)
-        return self._validate_and_execute(proposal)
-    def _validate_and_execute(self, proposal: str) -> KernelResult:
-        try:
-            reports = [validator.validate(proposal) for validator in self._validators]
-        except Exception:
-            self._transition(KernelState.HALTED)
-            logger.exception('Validator failed; kernel halted')
-            raise
-        failures = [issue for report in reports for issue in report.issues]
-        if any(not report.valid for report in reports) and not failures:
-            failures.append('A validator rejected the proposal without a diagnostic')
-        if failures:
-            reason = '; '.join(failures)
-            self._transition(KernelState.REJECTED)
-            self._transition(KernelState.IDLE)
-            logger.warning('Proposal rejected: %s', reason)
-            return KernelResult('REJECTED', self._state, False, reason)
-        self._transition(KernelState.EXECUTING)
-        try:
-            result: SandboxResult = self._sandbox.execute(proposal)
-            if not result.success:
-                self._transition(KernelState.REJECTED)
-                reason = result.error or 'Sandbox reported execution failure'
-                self._transition(KernelState.IDLE)
-                return KernelResult('FAILED', self._state, False, reason, result.output)
-            if self._adapter is not None and not self._adapter.apply_patch(proposal):
-                self._transition(KernelState.REJECTED)
-                self._transition(KernelState.IDLE)
-                return KernelResult('APPLY_FAILED', self._state, False,
-                                    'Environment adapter declined patch application', result.output)
-        except Exception:
-            self._transition(KernelState.HALTED)
-            logger.exception('Execution or patch application failed; kernel halted')
-            raise
-        self._transition(KernelState.IDLE)
-        return KernelResult('SUCCESS', self._state, True, output=result.output)
+        class FixedAdvisory:
+            def analyze_and_propose(self, code_snippet: str, error_log: str,
+                                    code_graph: str = '') -> Any:
+                from dataclasses import make_dataclass
+                return make_dataclass('FixedProposal', [('proposed_patch', str)])(proposal)
+        return self.process_with_advisor(FixedAdvisory(), '', '', '')
     def halt(self) -> None:
-        if self._state is not KernelState.HALTED:
-            self._transition(KernelState.HALTED)
+        if self._state in (KernelState.COMPLETED, KernelState.FAILED, KernelState.HALTED):
+            return
+        self._transition(KernelState.HALTED)
