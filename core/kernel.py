@@ -88,10 +88,7 @@ class ExecutionKernel:
         if return_code is not None:
             parts.append(f'Sandbox return code: {return_code}')
         if output:
-            parts.append('Captured sandbox output/traceback (verbatim):
-' + output)
-        return '
-'.join(parts)
+            parts.append('Captured sandbox output/traceback (verbatim):\n' + output)         return '\n'.join(parts)
     def process_with_advisor(self, advisor: Advisory, source: str, diagnostics: str,
                              code_graph: str = '', max_retries: int | None = None) -> KernelResult:
         """Ask for a patch, validate/run it, and feed exact failures into retries."""
