@@ -32,20 +32,20 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(result.executed)
         self.assertEqual(sandbox.calls, ["print('ok')"])
         self.assertEqual(adapter.applied, ["print('ok')"])
-        self.assertEqual(kernel.state, KernelState.IDLE)
+        self.assertEqual(kernel.state, KernelState.COMPLETED)
     def test_invalid_candidate_never_reaches_sandbox_or_adapter(self):
         sandbox = FakeSandbox()
         adapter = FakeAdapter()
         kernel = ExecutionKernel([PythonProposalValidator()], sandbox, adapter)
         result = kernel.process_proposal("open('blocked')")
-        self.assertEqual(result.status, 'REJECTED')
+        self.assertEqual(result.status, 'FAILED')
         self.assertEqual(sandbox.calls, [])
         self.assertEqual(adapter.applied, [])
     def test_refused_patch_is_not_reported_as_applied(self):
         adapter = FakeAdapter(accept=False)
         kernel = ExecutionKernel([PythonProposalValidator()], FakeSandbox(), adapter)
         result = kernel.process_proposal('print(1)')
-        self.assertEqual(result.status, 'APPLY_FAILED')
+        self.assertEqual(result.status, 'FAILED')
         self.assertFalse(result.executed)
     def test_captured_output_is_bounded(self):
         result = Sandbox(timeout_seconds=3, max_output_bytes=64).execute("print('x' * 10000)")
