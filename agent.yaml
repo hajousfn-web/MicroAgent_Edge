@@ -1,0 +1,4 @@
+name: MicroAgent-Edge-Gemma4
+version: "1.0"
+entrypoint: python runner.py
+timeout: 43200

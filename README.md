@@ -40,6 +40,20 @@ Provide an offline inference adapter exposing `generate(prompt: str) -> str` tha
 
 The runner expects source text (or a source file mapping) in each task or its graph record; graph files containing only AST metadata cannot provide replacement source. Its Python-only validator and subprocess harness are not a security boundary and must not execute untrusted proposals on a host without OS-level isolation.
 
+## Submission archive
+
+Run `python build_submission.py` to create and structurally verify `submission.zip`
+at the repository root. The archive contains `agent.yaml`, `runner.py`,
+`requirements.txt`, and the `core/`, `agent/`, and `adapters/` source trees.
+
+This archive is a packaging smoke-test, not a verified competition submission.
+The current Kaggle harness describes `agent.yaml` as a declarative ADK
+configuration and does not allow Python code entrypoints. The requested
+`entrypoint` metadata and the current runner's external inference-backend
+requirement have not been validated against the competition compiler. Do not
+assume the generated archive will pass Kaggle validation until it is converted
+to the supported declarative schema and tested with the official harness.
+
 ## Scope and limitations
 
 This is a research prototype, not certified embedded safety software. C/C++ memory and array-bound analysis, device telemetry, compiler integration, multi-file patch generation, rollback, and OS-level sandboxing require target-specific implementations. `PythonProposalValidator` checks syntax and a small deterministic denylist; it does not establish program correctness.
